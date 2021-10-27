@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/tsuna/gohbase/pb"
 	"google.golang.org/protobuf/proto"
@@ -70,6 +71,13 @@ type Scan struct {
 
 	closeScanner        bool
 	allowPartialResults bool
+	isRenewScan         bool
+
+	// renewer settings aren't used the scan directly but are read by the
+	// implementing function to allow per scan settings
+	renewerStart    bool
+	renewerLimit    uint
+	renewerInterval time.Duration
 }
 
 // baseScan returns a Scan struct with default values set.
@@ -97,10 +105,12 @@ func baseScan(ctx context.Context, table []byte,
 func (s *Scan) String() string {
 	return fmt.Sprintf("Scan{Table=%q StartRow=%q StopRow=%q TimeRange=(%d, %d) "+
 		"MaxVersions=%d NumberOfRows=%d MaxResultSize=%d Familes=%v Filter=%v "+
-		"StoreLimit=%d StoreOffset=%d ScannerID=%d Close=%v}",
+		"StoreLimit=%d StoreOffset=%d ScannerID=%d Close=%v, "+
+		"IsRenew=%v, RenewerEnable=%v, RenewerLimit=%v, RenewerInterval=%v}",
 		s.table, s.startRow, s.stopRow, s.fromTimestamp, s.toTimestamp,
 		s.maxVersions, s.numberOfRows, s.maxResultSize, s.families, s.filter,
-		s.storeLimit, s.storeOffset, s.scannerID, s.closeScanner)
+		s.storeLimit, s.storeOffset, s.scannerID, s.closeScanner,
+		s.isRenewScan, s.renewerStart, s.renewerLimit, s.renewerInterval)
 }
 
 // NewScan creates a scanner for the given table.
@@ -172,6 +182,19 @@ func (s *Scan) NumberOfRows() uint32 {
 	return s.numberOfRows
 }
 
+// RenewOptions is in an internal method which provides the Scan Renewer options
+// for the specific scan. You should not need to use this method.
+func (s *Scan) RenewOptions() (bool, uint, time.Duration) {
+	// Handle uninitalized variables here - essentially selecting defaults.
+	if s.renewerLimit == 0 {
+		// No change - by default enforce no limit.
+	}
+	if s.renewerInterval == 0 {
+		s.renewerInterval = 30 * time.Second
+	}
+	return s.renewerStart, s.renewerLimit, s.renewerInterval
+}
+
 // ToProto converts this Scan into a protobuf message
 func (s *Scan) ToProto() proto.Message {
 	scan := &pb.ScanRequest{
@@ -183,6 +206,9 @@ func (s *Scan) ToProto() proto.Message {
 		// tell server that we "handle" heartbeats by ignoring them
 		// since we don't really time out our scans (unless context was cancelled)
 		ClientHandlesHeartbeats: proto.Bool(true),
+		// tell server if we want to renew, this will ignore all other requests and
+		// just renew the scanner lease.
+		Renew: &s.isRenewScan,
 	}
 	if s.scannerID != math.MaxUint64 {
 		scan.ScannerId = &s.scannerID
@@ -258,6 +284,65 @@ func ScannerID(id uint64) func(Call) error {
 			return errors.New("'ScannerID' option can only be used with Scan queries")
 		}
 		scan.scannerID = id
+		return nil
+	}
+}
+
+// EnableScanRenewer is an option for scan requests.
+// This will start a goroutine per scan to automatically re-enable that scan.
+func EnableScanRenewer() func(Call) error {
+	return func(s Call) error {
+		scan, ok := s.(*Scan)
+		if !ok {
+			return errors.New("'EnableScanRenewer' option can only be used with Scan queries")
+		}
+		scan.renewerStart = true
+		return nil
+	}
+}
+
+// ScanRenewerLimit is an option for scan requests.
+// Specifies a limit of renewals to scans in the background. When this limit is reached, the
+// scan will no longer be renewed and a log is emitted, but the scan call may stil return
+// successfully. Set to zero to enforce no such limit.
+func ScanRenewerLimit(limit uint) func(Call) error {
+	return func(s Call) error {
+		scan, ok := s.(*Scan)
+		if !ok {
+			return errors.New("'ScanRenewerLimit' option can only be used with Scan queries")
+		}
+		scan.renewerLimit = limit
+		return nil
+	}
+}
+
+// ScanRenewerInterval is an option for scan requests.
+// Specifies the duration to automatically renew scanners.
+// By default, when left unset, it is set to 30 seconds.
+func ScanRenewerInterval(d time.Duration) func(Call) error {
+	return func(s Call) error {
+		scan, ok := s.(*Scan)
+		if !ok {
+			return errors.New("'ScanRenewerInterval' option can only be used with Scan queries")
+		}
+		if d == 0 {
+			return errors.New("'ScanRenewerInterval' option must be non-zero")
+		}
+		scan.renewerInterval = d
+		return nil
+	}
+}
+
+// InternalRenew is an option for scan requests.
+// This is an internal option to renew leases, this should not be needed by the average
+// user, instead use the ScanRenewerInterval option on the scanner.
+func InternalRenew() func(Call) error {
+	return func(s Call) error {
+		scan, ok := s.(*Scan)
+		if !ok {
+			return errors.New("'InternalRenew' option can only be used with Scan queries")
+		}
+		scan.isRenewScan = true
 		return nil
 	}
 }

@@ -3,6 +3,7 @@ module github.com/tsuna/gohbase
 go 1.13
 
 require (
+	github.com/benbjohnson/clock v1.1.0 // indirect
 	github.com/go-zookeeper/zk v1.0.2
 	github.com/golang/mock v1.4.3
 	github.com/golang/protobuf v1.4.0

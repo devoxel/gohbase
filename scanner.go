@@ -12,7 +12,11 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
+	"time"
 
+	"github.com/benbjohnson/clock"
+	log "github.com/sirupsen/logrus"
 	"github.com/tsuna/gohbase/hrpc"
 	"github.com/tsuna/gohbase/pb"
 	"google.golang.org/protobuf/proto"
@@ -27,12 +31,16 @@ type scanner struct {
 	RPCClient
 	// rpc is original scan query
 	rpc *hrpc.Scan
-	// curRegionScannerID is the id of scanner on current region
-	curRegionScannerID uint64
 	// startRow is the start row in the current region
 	startRow []byte
 	results  []*pb.Result
 	closed   bool
+	// curRegionScannerID is the id of scanner on current region
+	curRegionScannerID uint64
+	curRegionMutex     sync.RWMutex
+
+	closeRenewer chan struct{}
+	clock        clock.Clock // allows us to test renewal funcionality
 }
 
 func (s *scanner) fetch() ([]*pb.Result, error) {
@@ -111,12 +119,28 @@ func (s *scanner) coalesce(result, partial *pb.Result) (*pb.Result, bool) {
 }
 
 func newScanner(c RPCClient, rpc *hrpc.Scan) *scanner {
-	return &scanner{
+	return newScannerWithClock(c, rpc, clock.New())
+}
+
+func newScannerWithClock(c RPCClient, rpc *hrpc.Scan, cl clock.Clock) *scanner {
+	sc := &scanner{
 		RPCClient:          c,
 		rpc:                rpc,
 		startRow:           rpc.StartRow(),
 		curRegionScannerID: noScannerID,
+		clock:              cl,
 	}
+	go func() {
+		enable, limit, interval := rpc.RenewOptions()
+		if !enable {
+			return
+		}
+
+		if err := sc.ensureLease(limit, interval); err != nil {
+			log.WithField("scanner", c).Warn("failed to ensure lease:", err)
+		}
+	}()
+	return sc
 }
 
 func toLocalResult(r *pb.Result) *hrpc.Result {
@@ -254,8 +278,75 @@ func (s *scanner) Close() error {
 		return nil
 	}
 	s.closed = true
+	if s.closeRenewer != nil {
+		s.closeRenewer <- struct{}{}
+	}
 	// close the last region scanner
 	s.closeRegionScanner()
+	return nil
+}
+
+// ensureLease renews the scanner at a specified interval while the scan is open.
+func (s *scanner) ensureLease(limit uint, interval time.Duration) error {
+	if interval == 0 {
+		return errors.New("cannot create a timer with no interval")
+	}
+
+	s.closeRenewer = make(chan struct{})
+
+	var count uint
+	ticker := s.clock.Ticker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			count += 1
+			if limit > 0 && count > limit {
+				return errors.New("renew limit reached")
+			}
+			if err := s.renew(); err != nil {
+				return err
+			}
+		case <-s.rpc.Context().Done():
+			return s.rpc.Context().Err()
+		case <-s.closeRenewer:
+			return nil
+		}
+	}
+}
+
+func (s *scanner) renew() error {
+	if s.isRegionScannerClosed() {
+		// We can't renew with no open scanner, skip for now.
+		return nil
+	}
+	rpc, err := hrpc.NewScanRange(s.rpc.Context(),
+		s.rpc.Table(),
+		s.startRow,
+		nil,
+		hrpc.NumberOfRows(0),
+		hrpc.ScannerID(s.curRegionScannerID),
+		hrpc.InternalRenew())
+	if err != nil {
+		return fmt.Errorf("renew(): %w", err)
+	}
+
+	res, err := s.SendRPC(rpc)
+	if err != nil {
+		return fmt.Errorf("renew(): %w", err)
+	}
+
+	scanres, ok := res.(*pb.ScanResponse)
+	if !ok {
+		return errors.New("renew(): got non-ScanResponse for scan request")
+	}
+
+	// Ensure the result is empty, this is just a sanity check to ensure we aren't
+	// consuming messages from the scanner somehow.
+	if len(scanres.Results) > 0 {
+		panic("renew(): consuming messages from scanner in renew")
+	}
+
 	return nil
 }
 
@@ -292,6 +383,8 @@ func (s *scanner) isDone(resp *pb.ScanResponse, region hrpc.RegionInfo) bool {
 }
 
 func (s *scanner) isRegionScannerClosed() bool {
+	s.curRegionMutex.Lock()
+	defer s.curRegionMutex.Unlock()
 	return s.curRegionScannerID == noScannerID
 }
 
@@ -299,6 +392,8 @@ func (s *scanner) openRegionScanner(scannerId uint64) {
 	if !s.isRegionScannerClosed() {
 		panic(fmt.Sprintf("should not happen: previous region scanner was not closed"))
 	}
+	s.curRegionMutex.Lock()
+	defer s.curRegionMutex.Unlock()
 	s.curRegionScannerID = scannerId
 }
 
@@ -306,6 +401,8 @@ func (s *scanner) closeRegionScanner() {
 	if s.isRegionScannerClosed() {
 		return
 	}
+	s.curRegionMutex.Lock()
+	defer s.curRegionMutex.Unlock() // only unlock after RPC to hbase is resolved.
 	if !s.rpc.IsClosing() {
 		// Not closed at server side
 		// if we are closing in the middle of scanning a region,
