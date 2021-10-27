@@ -5,10 +5,11 @@
 package mock
 
 import (
+	reflect "reflect"
+
 	gomock "github.com/golang/mock/gomock"
 	hrpc "github.com/tsuna/gohbase/hrpc"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	reflect "reflect"
 )
 
 // MockRPCClient is a mock of RPCClient interface

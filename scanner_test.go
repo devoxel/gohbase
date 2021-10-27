@@ -9,6 +9,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"time"
+
+	"github.com/benbjohnson/clock"
 	"github.com/golang/mock/gomock"
 	"github.com/tsuna/gohbase/hrpc"
 	"github.com/tsuna/gohbase/pb"
@@ -93,6 +97,19 @@ func dup(a []*pb.Result) []*pb.Result {
 	return b
 }
 
+func testCallRenew(scan *hrpc.Scan, c *mock.MockRPCClient, scannerID uint64, t *testing.T) {
+	//	t.Helper()
+
+	s, err := hrpc.NewScanRange(context.Background(), table, nil, nil,
+		hrpc.ScannerID(scannerID), hrpc.InternalRenew(), hrpc.NumberOfRows(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c.EXPECT().SendRPC(&scanMatcher{scan: s}).Do(func(arg0 interface{}) {
+	}).Return(&pb.ScanResponse{}, nil).Times(1)
+}
+
 func testCallClose(scan *hrpc.Scan, c *mock.MockRPCClient, scannerID uint64,
 	group *sync.WaitGroup, t *testing.T) {
 	//	t.Helper()
@@ -107,6 +124,7 @@ func testCallClose(scan *hrpc.Scan, c *mock.MockRPCClient, scannerID uint64,
 		group.Done()
 	}).Return(&pb.ScanResponse{}, nil).Times(1)
 }
+
 func TestScanner(t *testing.T) {
 	ctrl := test.NewController(t)
 	defer ctrl.Finish()
@@ -629,5 +647,96 @@ func TestScannerClosed(t *testing.T) {
 	_, err = scanner.Next()
 	if err != io.EOF {
 		t.Fatalf("unexpected error %v, expected %v", err, io.EOF)
+	}
+}
+
+func TestScanRenewer(t *testing.T) {
+	ctrl := test.NewController(t)
+	c := mock.NewMockRPCClient(ctrl)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	defer wg.Wait()
+	defer ctrl.Finish()
+
+	ctx := context.Background()
+	scan, err := hrpc.NewScan(ctx, table, hrpc.EnableScanRenewer())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var scannerID uint64 = 42
+
+	mkClock := clock.NewMock()
+	scanner := newScannerWithClock(c, scan, mkClock)
+	runtime.Gosched()
+
+	ctx = scan.Context()
+	s, err := hrpc.NewScanRange(ctx, table, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c.EXPECT().SendRPC(&scanMatcher{scan: s}).Do(func(rpc hrpc.Call) {
+		rpc.SetRegion(region1)
+	}).Return(&pb.ScanResponse{
+		ScannerId:           cp(scannerID),
+		MoreResultsInRegion: proto.Bool(true),
+		Results:             dup(resultsPB[:1]),
+	}, nil).Times(1)
+
+	testCallRenew(scan, c, scannerID, t)
+	testCallRenew(scan, c, scannerID, t)
+
+	s, err = hrpc.NewScanRange(ctx, table, nil, nil,
+		hrpc.ScannerID(scannerID), hrpc.NumberOfRows(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c.EXPECT().SendRPC(&scanMatcher{scan: s}).Do(func(rpc hrpc.Call) {
+		rpc.SetRegion(region2)
+	}).Return(&pb.ScanResponse{
+		ScannerId: cp(scannerID),
+		Results:   dup(resultsPB[:2]),
+	}, nil).Times(1)
+
+	testCallClose(scan, c, scannerID, &wg, t)
+
+	scannerID += 1
+	c.EXPECT().SendRPC(&scanMatcher{scan: s}).Do(func(rpc hrpc.Call) {
+		rpc.SetRegion(region2)
+	}).Return(&pb.ScanResponse{
+		ScannerId:           cp(scannerID),
+		Results:             dup(resultsPB[:2]),
+		MoreResultsInRegion: proto.Bool(true),
+	}, nil).Times(1)
+
+	testCallClose(scan, c, scannerID, &wg, t)
+
+	mkClock.Add(61 * time.Second) // ensure we don't renew with no scanner ID
+
+	_, err = scanner.Next()
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+
+	mkClock.Add(61 * time.Second) // renew twice
+
+	_, err = scanner.Next()
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+	_, err = scanner.Next()
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+	_, err = scanner.Next()
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+	_, err = scanner.Next()
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
 	}
 }
